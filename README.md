@@ -8,5 +8,5 @@ https://youtu.be/xu3WI6P2Sa4
 
 Tab = White background.
 
-Backspace = Close acive preview.
+Backspace = Close active preview.
 
