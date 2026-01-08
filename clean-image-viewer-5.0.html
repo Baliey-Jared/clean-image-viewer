@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Image Reference Grid</title>
+
+<style>
+  body {
+    margin: 0;
+    padding: 40px;
+    background: white;
+    font-family: system-ui, sans-serif;
+  }
+
+  #picker {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  button {
+    background: none;
+    border: 1px solid #000;
+    padding: 10px 18px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+
+  #grid {
+  display: grid; /* ← THIS WAS MISSING */
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(calc(260px * var(--grid-zoom)), 1fr)
+  );
+  grid-auto-rows: calc(400px * var(--grid-zoom));
+  row-gap: calc(108px * var(--grid-zoom));
+  column-gap: calc(20px * var(--grid-zoom));
+
+  transition:
+    grid-auto-rows 0.15s ease,
+    row-gap 0.15s ease,
+    column-gap 0.15s ease;
+}
+
+
+
+  .item {
+    position: relative;
+  }
+
+  .image-frame {
+    width: 100%;
+    height: 100%;
+  }
+
+  .image-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    cursor: pointer;
+    background: #fff;
+  }
+
+  .filename {
+    position: absolute;
+    top: calc(100% + 10px);
+    width: 100%;
+    font-size: 12px;
+    color: #888;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+
+  /* ===== Preview Layer ===== */
+
+  #preview-layer {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    align-items: center;
+    justify-content: center;
+    padding: 60px;
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .preview-img {
+    object-fit: contain;
+    cursor: grab;
+    pointer-events: auto;
+    user-select: none;
+    -webkit-user-drag: none;
+    position: relative;
+    transform-origin: center center;
+    will-change: transform;
+  }
+
+  .preview-img.dragging {
+    cursor: grabbing;
+  }
+
+  #preview-layer::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: white;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.1s ease;
+  }
+
+  #preview-layer.solid-bg::before {
+    opacity: 1;
+  }
+</style>
+</head>
+
+<body>
+
+<div id="picker">
+  <button id="open">Select folder</button>
+  <input id="input" type="file" webkitdirectory hidden />
+</div>
+
+<div id="grid"></div>
+<div id="preview-layer"></div>
+
+<script>
+const open = document.getElementById("open");
+const input = document.getElementById("input");
+const grid = document.getElementById("grid");
+const picker = document.getElementById("picker");
+const previewLayer = document.getElementById("preview-layer");
+
+
+let gridZoom = 1;        // default density (MAX size)
+const GRID_ZOOM_MIN = 0.4; // very dense
+const GRID_ZOOM_MAX = 1;   // 🔒 cannot exceed default
+
+
+grid.style.setProperty("--grid-zoom", gridZoom);
+
+
+const CHUNK_SIZE = 100;
+let files = [];
+let fileIndex = 0;
+
+const previews = new Map();
+const pinned = new Set();
+let topZ = 10000;
+let activePreview = null;
+
+open.onclick = () => input.click();
+
+/* ===== Tab: white background ===== */
+let solidBackground = false;
+document.addEventListener("keydown", e => {
+  if (e.key === "Tab") {
+    e.preventDefault();
+    solidBackground = !solidBackground;
+    previewLayer.classList.toggle("solid-bg", solidBackground);
+  }
+});
+
+/* ===== Backspace: reset ===== */
+document.addEventListener("keydown", e => {
+  const tag = document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (e.key !== "Backspace") return;
+
+  e.preventDefault();
+
+  // === If previews exist, close most recent one ===
+  if (previews.size > 0) {
+    let topImg = null;
+    let topZIndex = -Infinity;
+
+    for (const img of previews.values()) {
+      const z = parseInt(img.style.zIndex || 0, 10);
+      if (z > topZIndex) {
+        topZIndex = z;
+        topImg = img;
+      }
+    }
+
+    if (topImg) {
+      pinned.delete(topImg);
+      topImg.remove();
+
+      for (const [file, img] of previews.entries()) {
+        if (img === topImg) {
+          previews.delete(file);
+          break;
+        }
+      }
+
+      if (activePreview === topImg) activePreview = null;
+
+      updatePreviewSizes();
+      return;
+    }
+  }
+
+  // === No previews left → full reset (existing behavior) ===
+  picker.style.display = "flex";
+  grid.style.display = "none";
+  grid.innerHTML = "";
+  previewLayer.innerHTML = "";
+  previewLayer.classList.remove("solid-bg");
+  previews.clear();
+  pinned.clear();
+  files = [];
+  fileIndex = 0;
+  topZ = 10000;
+  activePreview = null;
+  input.value = "";
+});
+
+
+/* ===== Pin preview (FIX) ===== */
+function pinPreview(img) {
+  if (pinned.has(img)) return;
+
+  const rect = img.getBoundingClientRect();
+
+  img.style.position = "fixed";
+  img.style.left = rect.left + "px";
+  img.style.top = rect.top + "px";
+
+  // 🔑 Lock visual size so it doesn't jump to natural resolution
+  img.style.width = rect.width + "px";
+  img.style.height = rect.height + "px";
+
+  img.style.maxWidth = "none";
+  img.style.maxHeight = "none";
+
+  img._x = 0;
+  img._y = 0;
+
+  pinned.add(img);
+}
+
+function getPreviewUnderCursor(e) {
+  return e.target.closest(".preview-img");
+}
+
+
+/* ===== Pinch to resize active preview ===== */
+const ZOOM_SPEED = 0.005;
+
+const GRID_ZOOM_SPEED = 0.0025;
+
+document.addEventListener("wheel", e => {
+
+// 🔒 ONLY zoom when Ctrl is held (trackpad pinch)
+if (!e.ctrlKey) return;
+
+const preview = e.target.closest(".preview-img");
+
+// === CASE 1: Cursor over preview → image zoom ===
+if (preview) {
+  e.preventDefault();
+
+  activePreview = preview;
+  pinPreview(preview);
+
+  const factor = Math.exp(-e.deltaY * ZOOM_SPEED);
+  const newScale = Math.min(5, Math.max(0.1, preview._scale * factor));
+  const appliedFactor = newScale / preview._scale;
+
+  // Cursor-centered scaling only if image has moved
+  if (preview._hasMoved) {
+    const rect = preview.getBoundingClientRect();
+    const cx = e.clientX - (rect.left + rect.width / 2);
+    const cy = e.clientY - (rect.top + rect.height / 2);
+
+    preview._x -= cx * (appliedFactor - 1);
+    preview._y -= cy * (appliedFactor - 1);
+  }
+
+  preview._scale = newScale;
+  preview.style.transform =
+    `translate(${preview._x}px, ${preview._y}px) scale(${preview._scale})`;
+
+  return;
+}
+
+// === CASE 2: Cursor not over preview → grid density zoom ===
+if (grid.style.display === "grid") {
+  e.preventDefault();
+
+  const factor = Math.exp(e.deltaY * GRID_ZOOM_SPEED);
+  gridZoom = Math.min(
+    GRID_ZOOM_MAX,
+    Math.max(GRID_ZOOM_MIN, gridZoom * factor)
+  );
+
+  grid.style.setProperty("--grid-zoom", gridZoom);
+}
+}, { passive: false });
+
+
+
+
+
+
+/* ===== Preview sizing ===== */
+function updatePreviewSizes() {
+  const active = [...previews.values()].filter(img => !pinned.has(img));
+  const count = active.length;
+  if (count === 0) return;
+
+  let columns = count === 1 ? 1 : count <= 4 ? 2 : 3;
+  const baseH = 0.9;
+  const maxW = Math.min(0.8 / columns, 0.48);
+  const scale = Math.min(1, 1 / Math.sqrt(count));
+
+  active.forEach(img => {
+    img.style.maxWidth = `${maxW * scale * 100}vw`;
+    img.style.maxHeight = `${baseH * scale * 100}vh`;
+    img._x = 0;
+    img._y = 0;
+    img._scale = 1;
+    img.style.transform = `translate(0px,0px) scale(1)`;
+  });
+}
+
+/* ===== Preview logic ===== */
+function togglePreview(file) {
+  if (previews.has(file)) {
+    const img = previews.get(file);
+    pinned.delete(img);
+    img.remove();
+    previews.delete(file);
+    if (activePreview === img) activePreview = null;
+    updatePreviewSizes();
+    return;
+  }
+
+  const img = document.createElement("img");
+  img.className = "preview-img";
+  img.draggable = false;
+  img.style.zIndex = ++topZ;
+
+  img._hasMoved = false;
+
+  img._x = 0;
+  img._y = 0;
+  img._scale = 1;
+
+  const url = URL.createObjectURL(file);
+  img.src = url;
+  img.onload = () => URL.revokeObjectURL(url);
+
+  img.addEventListener("mousedown", () => {
+    activePreview = img;
+    img.style.zIndex = ++topZ;
+  });
+
+  makeDraggable(img, () => {
+    pinPreview(img);
+    activePreview = img;
+    img.style.zIndex = ++topZ;
+  });
+
+  img.addEventListener("click", () => {
+    if (img._wasDragged) {
+      img._wasDragged = false;
+      return;
+    }
+    togglePreview(file);
+  });
+
+  previewLayer.appendChild(img);
+  previews.set(file, img);
+  // 🔑 NEW: mark newly previewed image as active
+  activePreview = img;
+  img.style.zIndex = ++topZ;
+
+updatePreviewSizes();
+
+}
+
+/* ===== Dragging ===== */
+function makeDraggable(el, onDragCommit) {
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+  const DRAG_THRESHOLD = 4;
+
+  el.addEventListener("mousedown", e => {
+    e.preventDefault();
+    startX = e.clientX;
+    startY = e.clientY;
+
+    function move(ev) {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+
+      if (!dragging && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
+        dragging = true;
+        el._wasDragged = true;
+        el._hasMoved = true;
+        el.classList.add("dragging");
+        el.style.zIndex = ++topZ;
+        onDragCommit?.();
+      }
+
+
+      if (dragging) {
+        el._x += ev.movementX;
+        el._y += ev.movementY;
+        el.style.transform = `translate(${el._x}px, ${el._y}px) scale(${el._scale})`;
+      }
+    }
+
+    function up() {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      if (dragging) el.classList.remove("dragging");
+      dragging = false;
+    }
+
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+}
+
+/* ===== Lazy loading ===== */
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(entry => {
+    if (!entry.isIntersecting) return;
+    const img = entry.target;
+    const file = files[img.dataset.index];
+    const url = URL.createObjectURL(file);
+    img.src = url;
+    img.onload = () => URL.revokeObjectURL(url);
+    observer.unobserve(img);
+  });
+}, { rootMargin: "400px" });
+
+function loadChunk() {
+  const fragment = document.createDocumentFragment();
+
+  for (let i = 0; i < CHUNK_SIZE && fileIndex < files.length; i++, fileIndex++) {
+    const file = files[fileIndex];
+
+    const item = document.createElement("div");
+    item.className = "item";
+
+    const frame = document.createElement("div");
+    frame.className = "image-frame";
+
+    const img = document.createElement("img");
+    img.dataset.index = fileIndex;
+    img.onclick = () => togglePreview(file);
+
+    observer.observe(img);
+
+    const label = document.createElement("div");
+    label.className = "filename";
+    label.textContent = file.name;
+
+    frame.appendChild(img);
+    item.appendChild(frame);
+    item.appendChild(label);
+    fragment.appendChild(item);
+  }
+
+  grid.appendChild(fragment);
+  if (fileIndex < files.length) requestIdleCallback(loadChunk);
+}
+
+const ALLOWED_EXTENSIONS = [
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".gif",
+  ".webp",
+  ".bmp"
+];
+
+function isSupportedImage(file) {
+  const name = file.name.toLowerCase();
+  return ALLOWED_EXTENSIONS.some(ext => name.endsWith(ext));
+}
+
+input.onchange = () => {
+  picker.style.display = "none";
+  grid.style.display = "grid";
+  grid.innerHTML = "";
+  previewLayer.innerHTML = "";
+  previews.clear();
+  pinned.clear();
+  topZ = 10000;
+  activePreview = null;
+
+  files = [...input.files].filter(isSupportedImage);
+
+  fileIndex = 0;
+  loadChunk();
+};
+</script>
+
+</body>
+</html>
