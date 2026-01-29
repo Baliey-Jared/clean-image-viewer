@@ -1,4 +1,4 @@
-# clean-image-viewer
+# container
 A clean, gesture-driven space for exploring and reinterpreting image collections.
 
 You can find a short demo vid here:
